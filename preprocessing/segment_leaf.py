@@ -1,8 +1,8 @@
-"""Color-space leaf segmentation and heuristic lesion-area estimation.
+"""Color-space leaf segmentation and conservative lesion/severity proxy.
 
 The RGB image remains the primary classifier input. HSV/Lab are used only for
-analysis. Lesion masks and severity are heuristic proxies, not expert-annotated
-agricultural ground truth.
+analysis. Leaf extraction uses a color proposal followed by GrabCut refinement.
+Lesion masks are conservative heuristic proxies, not expert-annotated ground truth.
 """
 from __future__ import annotations
 
@@ -44,27 +44,82 @@ def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     return cleaned
 
 
-def make_leaf_mask(rgb: np.ndarray) -> np.ndarray:
-    """Extract a leaf foreground mask using HSV/Lab cues and morphology."""
+def _rough_leaf_mask(rgb: np.ndarray) -> np.ndarray:
+    """Build a broad chromatic foreground proposal before GrabCut refinement."""
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     _, s, v = cv2.split(hsv)
     _, a, _ = cv2.split(lab)
 
     otsu, _ = cv2.threshold(s, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    sat_threshold = int(np.clip(otsu, 20, 75))
+    sat_threshold = int(np.clip(otsu, 25, 85))
+    candidate = (
+        ((s >= sat_threshold) & (v >= 20))
+        | ((a <= 152) & (s >= 22) & (v >= 20))
+    ).astype(np.uint8) * 255
 
-    saturated = (s >= sat_threshold) & (v >= 20)
-    greenish = (a <= 155) & (s >= 15) & (v >= 20)
-    candidate = (saturated | greenish).astype(np.uint8) * 255
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, kernel, iterations=2)
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel, iterations=1)
-    candidate = _largest_component(candidate)
+    return _largest_component(candidate)
 
-    contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    filled = np.zeros_like(candidate)
+
+def make_leaf_mask(rgb: np.ndarray) -> np.ndarray:
+    """Extract a leaf mask using HSV/Lab proposal + GrabCut refinement."""
+    rough = _rough_leaf_mask(rgb)
+    if int(np.count_nonzero(rough)) == 0:
+        return rough
+
+    h, w = rough.shape
+    ys, xs = np.where(rough > 0)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+
+    pad_x = max(5, int(0.03 * w))
+    pad_y = max(5, int(0.03 * h))
+    rx0, ry0 = max(0, x0 - pad_x), max(0, y0 - pad_y)
+    rx1, ry1 = min(w - 1, x1 + pad_x), min(h - 1, y1 + pad_y)
+
+    mask = np.full((h, w), cv2.GC_BGD, dtype=np.uint8)
+    mask[ry0 : ry1 + 1, rx0 : rx1 + 1] = cv2.GC_PR_BGD
+    mask[rough > 0] = cv2.GC_PR_FGD
+
+    fg_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    sure_fg = cv2.erode(rough, fg_kernel, iterations=2)
+    mask[sure_fg > 0] = cv2.GC_FGD
+
+    # The image border is normally background in PlantVillage. Keep definite
+    # foreground seeds intact for leaves that touch a border.
+    border = 4
+    for sl in (
+        (slice(0, border), slice(None)),
+        (slice(-border, None), slice(None)),
+        (slice(None), slice(0, border)),
+        (slice(None), slice(-border, None)),
+    ):
+        region = mask[sl]
+        region[region != cv2.GC_FGD] = cv2.GC_BGD
+
+    bg_model = np.zeros((1, 65), np.float64)
+    fg_model = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(rgb, mask, None, bg_model, fg_model, 5, cv2.GC_INIT_WITH_MASK)
+        refined = np.where(
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
+        ).astype(np.uint8)
+    except cv2.error:
+        refined = rough
+
+    refined = cv2.morphologyEx(
+        refined,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    refined = _largest_component(refined)
+
+    contours, _ = cv2.findContours(refined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(refined)
     if contours:
         contour = max(contours, key=cv2.contourArea)
         cv2.drawContours(filled, [contour], -1, 255, thickness=cv2.FILLED)
@@ -86,11 +141,9 @@ def _healthy_reference(lab: np.ndarray, hsv: np.ndarray, leaf_mask: np.ndarray) 
     h, s, v = cv2.split(hsv)
     _, a, _ = cv2.split(lab)
     green_core = leaf & (h >= 30) & (h <= 95) & (s >= 45) & (v >= 35) & (a <= 145)
-
     if int(green_core.sum()) < max(100, int(leaf.sum() * 0.03)):
         leaf_a = a[leaf]
         green_core = leaf & (a <= np.percentile(leaf_a, 45))
-
     pixels = lab[green_core]
     if len(pixels) == 0:
         pixels = lab[leaf]
@@ -123,12 +176,7 @@ def _kmeans_regions(lab: np.ndarray, leaf_mask: np.ndarray, random_state: int) -
 def estimate_lesions(
     rgb: np.ndarray, leaf_mask: np.ndarray, random_state: int = 42
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Estimate lesion candidates conservatively with Lab/HSV + K-Means.
-
-    This is a heuristic proxy only. It is designed to detect localized yellow,
-    brown, and red disease candidates while leaving ordinary green variation
-    alone; it is not expert annotation.
-    """
+    """Estimate conservative lesion candidates using Lab/HSV and K-Means."""
     leaf = leaf_mask > 0
     empty = np.zeros_like(leaf_mask)
     if int(leaf.sum()) < 100:
@@ -141,12 +189,12 @@ def estimate_lesions(
 
     reference = _healthy_reference(lab, hsv, leaf_mask)
     ref_l, ref_a, ref_b = reference
-
     labels, centers = _kmeans_regions(lab, leaf_mask, random_state)
     if centers.size == 0:
         return empty, empty.copy(), empty.copy()
 
-    # Retain only K-Means regions with meaningful distance from the green reference.
+    # K-Means proposes image-specific color regions; pixel gates below keep
+    # only regions with meaningful distance from healthy green tissue.
     center_distance = np.sqrt(
         ((centers[:, 0] - ref_l) / 18.0) ** 2
         + ((centers[:, 1] - ref_a) / 10.0) ** 2
@@ -161,41 +209,42 @@ def estimate_lesions(
     b_delta = b - ref_b
     l_delta = l - ref_l
 
-    # Local color signatures. Plant disease spots in this controlled dataset
-    # commonly shift toward yellow/brown/red relative to green tissue.
+    # Conservative local color signatures for brown/red necrosis and yellow
+    # chlorosis. These are engineering heuristics, not agricultural standards.
     brown_red = (
-        (a_delta >= 9.0)
-        & (b_delta >= -4.0)
-        & (s >= 35)
-        & (v >= 20)
+        (a_delta >= 9.0) & (b_delta >= -4.0) & (s >= 35) & (v >= 20)
     )
     yellow = (
-        (b_delta >= 12.0)
-        & (a_delta >= -8.0)
-        & (s >= 30)
-        & (v >= 30)
+        (b_delta >= 12.0) & (a_delta >= -8.0)
+        & (l >= ref_l - 10.0) & (s >= 30)
     )
     dark_abnormal = (
-        (l_delta <= -20.0)
-        & (a_delta >= 3.0)
-        & (s >= 35)
+        (l_delta <= -20.0) & (a_delta >= 3.0) & (s >= 35)
     )
 
     necrotic = leaf & meaningful & (brown_red | dark_abnormal)
     chlorotic = leaf & meaningful & yellow & ~necrotic
 
-    # Prevent a large smooth region from being called a lesion simply because
-    # its color differs. Connected components impose localized spatial support.
-    leaf_area = max(1, int(leaf_mask.sum() / 255))
-    min_area = max(20, int(leaf_area * 0.0002))
+    # Exclude a narrow outer boundary band to reduce edge-shadow false positives.
+    boundary_band = cv2.dilate(
+        extract_boundary(leaf_mask, thickness=3),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    ) > 0
+    necrotic[boundary_band] = False
+    chlorotic[boundary_band] = False
+
+    leaf_area = max(1, int(np.count_nonzero(leaf_mask)))
+    min_area = max(30, int(leaf_area * 0.00025))
     necrotic_u8 = _remove_small_components(necrotic.astype(np.uint8) * 255, min_area)
     chlorotic_u8 = _remove_small_components(chlorotic.astype(np.uint8) * 255, min_area)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     necrotic_u8 = cv2.morphologyEx(necrotic_u8, cv2.MORPH_OPEN, kernel)
     chlorotic_u8 = cv2.morphologyEx(chlorotic_u8, cv2.MORPH_OPEN, kernel)
+    necrotic_u8 = cv2.bitwise_and(necrotic_u8, leaf_mask)
+    chlorotic_u8 = cv2.bitwise_and(chlorotic_u8, leaf_mask)
+    chlorotic_u8[necrotic_u8 > 0] = 0
     lesion = cv2.bitwise_or(necrotic_u8, chlorotic_u8)
-    lesion = cv2.bitwise_and(lesion, leaf_mask)
     return lesion, chlorotic_u8, necrotic_u8
 
 
