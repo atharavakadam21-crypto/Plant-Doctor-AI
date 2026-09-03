@@ -3,8 +3,8 @@
 Usage:
     python preprocessing/run_segmentation.py --image path/to/leaf.jpg
 
-Outputs a PNG containing the RGB image, leaf mask, lesion mask, and overlay
-under results/segmentation/. It also prints the severity index and components.
+Outputs a labeled PNG containing RGB image, leaf mask, boundary, lesion mask,
+and lesion overlay under results/segmentation/.
 """
 from __future__ import annotations
 
@@ -24,6 +24,13 @@ def overlay_mask(rgb: np.ndarray, mask: np.ndarray, color: tuple[int, int, int])
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def add_title(image: np.ndarray, title: str) -> np.ndarray:
+    canvas = image.copy()
+    cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 30), (0, 0, 0), -1)
+    cv2.putText(canvas, title, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1, cv2.LINE_AA)
+    return canvas
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=Path, required=True)
@@ -33,18 +40,19 @@ def main() -> None:
     result = segment_and_score(args.image)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    leaf_overlay = overlay_mask(result.rgb, result.leaf_mask, (0, 255, 0))
+    leaf_mask_rgb = np.repeat(result.leaf_mask[..., None], 3, axis=2)
+    boundary_overlay = overlay_mask(result.rgb, result.boundary_mask, (0, 255, 0))
+    lesion_mask_rgb = np.repeat(result.lesion_mask[..., None], 3, axis=2)
     lesion_overlay = overlay_mask(result.rgb, result.lesion_mask, (255, 0, 0))
 
-    canvas = np.concatenate(
-        [
-            result.rgb,
-            np.repeat(result.leaf_mask[..., None], 3, axis=2),
-            np.repeat(result.lesion_mask[..., None], 3, axis=2),
-            lesion_overlay,
-        ],
-        axis=1,
-    )
+    panels = [
+        add_title(result.rgb, "RGB input"),
+        add_title(leaf_mask_rgb, "Leaf mask"),
+        add_title(boundary_overlay, "Leaf boundary"),
+        add_title(lesion_mask_rgb, "Lesion proxy"),
+        add_title(lesion_overlay, "Lesion overlay"),
+    ]
+    canvas = np.concatenate(panels, axis=1)
 
     out_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
     output_path = args.output_dir / f"{args.image.stem}_segmentation.png"
