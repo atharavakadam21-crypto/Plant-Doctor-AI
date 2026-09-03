@@ -1,7 +1,7 @@
-"""Segmentation quality helpers for multi-image sanity validation.
+"""Geometry-based diagnostics for heuristic leaf segmentation.
 
-These checks are conservative engineering diagnostics. They do not claim
-expert lesion annotations or an agricultural validation standard.
+These checks identify suspicious masks; they do not validate disease lesions and
+do not claim expert agricultural ground truth.
 """
 from __future__ import annotations
 
@@ -37,22 +37,22 @@ def count_components(mask: np.ndarray) -> int:
 
 
 def summarize(mask: np.ndarray, lesion_mask: np.ndarray, severity_percent: float) -> SegmentationQuality:
-    """Summarize area, geometry, and confidence indicators for one image."""
+    """Summarize mask geometry and return a conservative quality flag."""
     leaf_binary = (mask > 0).astype(np.uint8)
     leaf_area = int(leaf_binary.sum())
     image_area = int(mask.shape[0] * mask.shape[1])
     lesion_area = int(np.count_nonzero(lesion_mask))
-    leaf_coverage = (leaf_area / max(1, image_area)) * 100.0
-    lesion_coverage = (lesion_area / max(1, leaf_area)) * 100.0
+    coverage = leaf_area / max(1, image_area) * 100.0
+    lesion_coverage = lesion_area / max(1, leaf_area) * 100.0
 
     contours, _ = cv2.findContours(leaf_binary * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours or leaf_area == 0:
         return SegmentationQuality(
             leaf_area_px=leaf_area,
             image_area_px=image_area,
-            leaf_coverage_percent=float(leaf_coverage),
+            leaf_coverage_percent=coverage,
             lesion_area_px=lesion_area,
-            lesion_coverage_percent_of_leaf=float(lesion_coverage),
+            lesion_coverage_percent_of_leaf=lesion_coverage,
             severity_percent=float(severity_percent),
             lesion_components=count_components(lesion_mask),
             border_contact_percent=100.0,
@@ -66,55 +66,60 @@ def summarize(mask: np.ndarray, lesion_mask: np.ndarray, severity_percent: float
     contour = max(contours, key=cv2.contourArea)
     contour_area = float(cv2.contourArea(contour))
     hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
-    solidity = contour_area / hull_area if hull_area > 0 else 0.0
+    solidity = contour_area / hull_area if hull_area else 0.0
     x, y, width, height = cv2.boundingRect(contour)
     extent = contour_area / max(1, width * height)
 
     h, w = mask.shape[:2]
-    border = max(2, int(round(min(h, w) * 0.01)))
-    border_pixels = np.concatenate(
-        [
-            leaf_binary[:border, :].ravel(),
-            leaf_binary[-border:, :].ravel(),
-            leaf_binary[:, :border].ravel(),
-            leaf_binary[:, -border:].ravel(),
-        ]
-    )
-    border_contact = float(border_pixels.sum()) / max(1.0, float(4 * border * min(h, w)))
-    border_contact = min(1.0, max(0.0, border_contact))
+    edge = max(2, int(round(min(h, w) * 0.01)))
+    edge_mask = np.zeros_like(leaf_binary)
+    edge_mask[:edge, :] = 1
+    edge_mask[-edge:, :] = 1
+    edge_mask[:, :edge] = 1
+    edge_mask[:, -edge:] = 1
+    border_pixels = leaf_binary[edge_mask > 0]
+    border_contact = float(border_pixels.mean() * 100.0) if border_pixels.size else 0.0
 
-    # Geometry-based quality score. This is only a flagging heuristic: the
-    # project does not have expert leaf masks to turn this into a true metric.
-    coverage_term = 1.0 if 0.08 <= leaf_coverage / 100.0 <= 0.75 else 0.0
-    solidity_term = float(np.clip((solidity - 0.30) / 0.55, 0.0, 1.0))
-    extent_term = float(np.clip((extent - 0.18) / 0.60, 0.0, 1.0))
-    border_term = float(np.clip(1.0 - border_contact / 0.40, 0.0, 1.0))
+    # Coverage is only used to flag obviously tiny/all-frame masks. Real leaves
+    # may legitimately occupy most of a PlantVillage frame, so there is no hard
+    # upper limit such as 75%.
+    coverage_score = float(np.clip((coverage - 8.0) / 15.0, 0.0, 1.0))
+    all_frame_penalty = float(np.clip((coverage - 96.0) / 4.0, 0.0, 1.0))
+    solidity_score = float(np.clip((solidity - 0.45) / 0.45, 0.0, 1.0))
+    extent_score = float(np.clip((extent - 0.20) / 0.55, 0.0, 1.0))
+    border_score = 1.0 - float(np.clip((border_contact - 75.0) / 25.0, 0.0, 1.0))
+
     score = 100.0 * (
-        0.35 * coverage_term
-        + 0.25 * solidity_term
-        + 0.20 * extent_term
-        + 0.20 * border_term
+        0.20 * coverage_score
+        + 0.35 * solidity_score
+        + 0.30 * extent_score
+        + 0.15 * border_score
     )
+    score *= 1.0 - 0.35 * all_frame_penalty
 
-    if score >= 75.0:
+    if score >= 70.0:
         quality = "PASS"
-    elif score >= 55.0:
+    elif score >= 50.0:
         quality = "REVIEW"
     else:
         quality = "LOW_CONFIDENCE"
 
+    # Severity can be used downstream only when the leaf geometry itself is
+    # reasonably credible. The exact thresholds are engineering flags.
+    usable = bool(score >= 50.0)
+
     return SegmentationQuality(
         leaf_area_px=leaf_area,
         image_area_px=image_area,
-        leaf_coverage_percent=float(leaf_coverage),
+        leaf_coverage_percent=coverage,
         lesion_area_px=lesion_area,
-        lesion_coverage_percent_of_leaf=float(lesion_coverage),
+        lesion_coverage_percent_of_leaf=lesion_coverage,
         severity_percent=float(severity_percent),
         lesion_components=count_components(lesion_mask),
-        border_contact_percent=border_contact * 100.0,
+        border_contact_percent=border_contact,
         solidity=float(solidity),
         extent=float(extent),
         quality_score=float(score),
         quality=quality,
-        usable_for_severity=bool(score >= 55.0),
+        usable_for_severity=usable,
     )
