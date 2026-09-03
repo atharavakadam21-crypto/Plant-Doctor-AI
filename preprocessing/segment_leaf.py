@@ -45,18 +45,18 @@ def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
 
 
 def make_leaf_mask(rgb: np.ndarray) -> np.ndarray:
-    """Extract a leaf mask using adaptive HSV saturation + Lab green cues."""
+    """Extract a leaf foreground mask using HSV/Lab cues and morphology."""
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     _, s, v = cv2.split(hsv)
     _, a, _ = cv2.split(lab)
 
-    otsu_threshold, _ = cv2.threshold(s, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    sat_threshold = max(20, min(int(otsu_threshold), 70))
+    otsu, _ = cv2.threshold(s, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    sat_threshold = int(np.clip(otsu, 20, 75))
 
     saturated = (s >= sat_threshold) & (v >= 20)
-    green_tissue = (a <= 150) & (s >= 15) & (v >= 20)
-    candidate = (saturated | green_tissue).astype(np.uint8) * 255
+    greenish = (a <= 155) & (s >= 15) & (v >= 20)
+    candidate = (saturated | greenish).astype(np.uint8) * 255
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -80,96 +80,123 @@ def extract_boundary(leaf_mask: np.ndarray, thickness: int = 2) -> np.ndarray:
     return boundary
 
 
-def estimate_lesions(
-    rgb: np.ndarray, leaf_mask: np.ndarray, random_state: int = 42
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Estimate lesion candidates with Lab K-Means plus conservative color gates.
+def _healthy_reference(lab: np.ndarray, hsv: np.ndarray, leaf_mask: np.ndarray) -> np.ndarray:
+    """Estimate a robust green-tissue Lab reference for the current leaf."""
+    leaf = leaf_mask > 0
+    h, s, v = cv2.split(hsv)
+    _, a, _ = cv2.split(lab)
+    green_core = leaf & (h >= 30) & (h <= 95) & (s >= 45) & (v >= 35) & (a <= 145)
 
-    K-Means is used only to propose color regions. The non-healthy clusters are
-    counted as lesions only when their centroids differ from a green healthy
-    reference. The output is a heuristic proxy, not expert ground truth.
-    """
-    leaf_pixels = leaf_mask > 0
-    empty = np.zeros_like(leaf_mask)
-    if int(leaf_pixels.sum()) < 100:
-        return empty, empty.copy(), empty.copy()
+    if int(green_core.sum()) < max(100, int(leaf.sum() * 0.03)):
+        leaf_a = a[leaf]
+        green_core = leaf & (a <= np.percentile(leaf_a, 45))
 
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    pixels = lab[green_core]
+    if len(pixels) == 0:
+        pixels = lab[leaf]
+    return np.median(pixels, axis=0).astype(np.float32)
 
-    interior_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    interior = cv2.erode(leaf_mask, interior_kernel, iterations=1) > 0
+
+def _kmeans_regions(lab: np.ndarray, leaf_mask: np.ndarray, random_state: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-pixel K-Means labels and cluster centers inside leaf interior."""
+    leaf = leaf_mask > 0
+    interior = cv2.erode(
+        leaf_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    ) > 0
     if int(interior.sum()) < 100:
-        interior = leaf_pixels
+        interior = leaf
 
     coords = np.column_stack(np.where(interior))
-    pixels = lab[interior]
-    if len(pixels) < 30:
-        return empty, empty.copy(), empty.copy()
+    pixels = lab[interior].astype(np.float32)
+    if len(coords) < 30:
+        return np.full(leaf_mask.shape, -1, dtype=np.int8), np.empty((0, 3), dtype=np.float32)
 
     kmeans = KMeans(n_clusters=3, random_state=random_state, n_init=10)
     labels = kmeans.fit_predict(pixels)
-    centers = kmeans.cluster_centers_
-    counts = np.bincount(labels, minlength=3)
+    image_labels = np.full(leaf_mask.shape, -1, dtype=np.int8)
+    image_labels[coords[:, 0], coords[:, 1]] = labels
+    return image_labels, kmeans.cluster_centers_
 
-    # Prefer a well-supported green cluster as the healthy reference.
-    green_candidates = [i for i in range(3) if centers[i, 1] <= np.percentile(centers[:, 1], 66)]
-    healthy_label = max(green_candidates, key=lambda i: counts[i]) if green_candidates else int(np.argmax(counts))
-    healthy = centers[healthy_label]
-    remaining = [i for i in range(3) if i != healthy_label]
 
-    chlorotic_label = max(remaining, key=lambda i: centers[i, 2]) if remaining else None
-    necrotic_label = None
-    if remaining and chlorotic_label is not None:
-        rest = [i for i in remaining if i != chlorotic_label]
-        if rest:
-            necrotic_label = min(rest, key=lambda i: centers[i, 0])
+def estimate_lesions(
+    rgb: np.ndarray, leaf_mask: np.ndarray, random_state: int = 42
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate lesion candidates conservatively with Lab/HSV + K-Means.
 
-    # Robust within-leaf spreads make the gates image-adaptive instead of fixed
-    # to one photographed leaf.
-    mad = np.median(np.abs(pixels - np.median(pixels, axis=0)), axis=0)
-    l_gate = max(12.0, float(mad[0]) * 1.8)
-    a_gate = max(5.0, float(mad[1]) * 1.0)
-    b_gate = max(7.0, float(mad[2]) * 1.0)
+    This is a heuristic proxy only. It is designed to detect localized yellow,
+    brown, and red disease candidates while leaving ordinary green variation
+    alone; it is not expert annotation.
+    """
+    leaf = leaf_mask > 0
+    empty = np.zeros_like(leaf_mask)
+    if int(leaf.sum()) < 100:
+        return empty, empty.copy(), empty.copy()
 
-    chlorotic_valid = False
-    if chlorotic_label is not None:
-        c = centers[chlorotic_label]
-        chlorotic_valid = (
-            c[2] >= healthy[2] + b_gate
-            and c[0] >= healthy[0] - l_gate
-            and c[1] >= healthy[1] - a_gate
-        )
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    l, a, b = [x.astype(np.float32) for x in cv2.split(lab)]
+    h, s, v = [x.astype(np.float32) for x in cv2.split(hsv)]
 
-    necrotic_valid = False
-    if necrotic_label is not None:
-        n = centers[necrotic_label]
-        necrotic_valid = (
-            (n[0] <= healthy[0] - l_gate and n[1] >= healthy[1] - a_gate)
-            or (n[1] >= healthy[1] + a_gate and n[0] <= healthy[0] + 10.0)
-        )
+    reference = _healthy_reference(lab, hsv, leaf_mask)
+    ref_l, ref_a, ref_b = reference
 
-    label_image = np.full(leaf_mask.shape, -1, dtype=np.int8)
-    label_image[coords[:, 0], coords[:, 1]] = labels
+    labels, centers = _kmeans_regions(lab, leaf_mask, random_state)
+    if centers.size == 0:
+        return empty, empty.copy(), empty.copy()
 
-    chlorotic = (
-        ((label_image == chlorotic_label) & leaf_pixels).astype(np.uint8) * 255
-        if chlorotic_valid and chlorotic_label is not None else empty.copy()
+    # Retain only K-Means regions with meaningful distance from the green reference.
+    center_distance = np.sqrt(
+        ((centers[:, 0] - ref_l) / 18.0) ** 2
+        + ((centers[:, 1] - ref_a) / 10.0) ** 2
+        + ((centers[:, 2] - ref_b) / 12.0) ** 2
     )
-    necrotic = (
-        ((label_image == necrotic_label) & leaf_pixels).astype(np.uint8) * 255
-        if necrotic_valid and necrotic_label is not None else empty.copy()
+    meaningful = np.zeros_like(leaf, dtype=bool)
+    for idx, distance in enumerate(center_distance):
+        if distance >= 1.25:
+            meaningful |= labels == idx
+
+    a_delta = a - ref_a
+    b_delta = b - ref_b
+    l_delta = l - ref_l
+
+    # Local color signatures. Plant disease spots in this controlled dataset
+    # commonly shift toward yellow/brown/red relative to green tissue.
+    brown_red = (
+        (a_delta >= 9.0)
+        & (b_delta >= -4.0)
+        & (s >= 35)
+        & (v >= 20)
+    )
+    yellow = (
+        (b_delta >= 12.0)
+        & (a_delta >= -8.0)
+        & (s >= 30)
+        & (v >= 30)
+    )
+    dark_abnormal = (
+        (l_delta <= -20.0)
+        & (a_delta >= 3.0)
+        & (s >= 35)
     )
 
-    # Keep only spatially meaningful candidate regions.
-    min_area = max(20, int(np.count_nonzero(leaf_mask) * 0.0002))
-    chlorotic = _remove_small_components(chlorotic, min_area)
-    necrotic = _remove_small_components(necrotic, min_area)
+    necrotic = leaf & meaningful & (brown_red | dark_abnormal)
+    chlorotic = leaf & meaningful & yellow & ~necrotic
 
-    small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    chlorotic = cv2.morphologyEx(chlorotic, cv2.MORPH_OPEN, small_kernel)
-    necrotic = cv2.morphologyEx(necrotic, cv2.MORPH_OPEN, small_kernel)
-    lesion = cv2.bitwise_and(cv2.bitwise_or(chlorotic, necrotic), leaf_mask)
-    return lesion, chlorotic, necrotic
+    # Prevent a large smooth region from being called a lesion simply because
+    # its color differs. Connected components impose localized spatial support.
+    leaf_area = max(1, int(leaf_mask.sum() / 255))
+    min_area = max(20, int(leaf_area * 0.0002))
+    necrotic_u8 = _remove_small_components(necrotic.astype(np.uint8) * 255, min_area)
+    chlorotic_u8 = _remove_small_components(chlorotic.astype(np.uint8) * 255, min_area)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    necrotic_u8 = cv2.morphologyEx(necrotic_u8, cv2.MORPH_OPEN, kernel)
+    chlorotic_u8 = cv2.morphologyEx(chlorotic_u8, cv2.MORPH_OPEN, kernel)
+    lesion = cv2.bitwise_or(necrotic_u8, chlorotic_u8)
+    lesion = cv2.bitwise_and(lesion, leaf_mask)
+    return lesion, chlorotic_u8, necrotic_u8
 
 
 def segment_and_score(image_path: str | Path, random_state: int = 42) -> SegmentationResult:
