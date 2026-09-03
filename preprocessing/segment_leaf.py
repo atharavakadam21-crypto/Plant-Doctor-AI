@@ -65,7 +65,7 @@ def _rough_leaf_mask(rgb: np.ndarray) -> np.ndarray:
 
 
 def make_leaf_mask(rgb: np.ndarray) -> np.ndarray:
-    """Extract a leaf mask using HSV/Lab proposal + GrabCut refinement."""
+    """Extract a leaf mask using HSV/Lab proposal + constrained GrabCut refinement."""
     rough = _rough_leaf_mask(rgb)
     if int(np.count_nonzero(rough)) == 0:
         return rough
@@ -88,8 +88,6 @@ def make_leaf_mask(rgb: np.ndarray) -> np.ndarray:
     sure_fg = cv2.erode(rough, fg_kernel, iterations=2)
     mask[sure_fg > 0] = cv2.GC_FGD
 
-    # The image border is normally background in PlantVillage. Keep definite
-    # foreground seeds intact for leaves that touch a border.
     border = 4
     for sl in (
         (slice(0, border), slice(None)),
@@ -109,6 +107,22 @@ def make_leaf_mask(rgb: np.ndarray) -> np.ndarray:
         ).astype(np.uint8)
     except cv2.error:
         refined = rough
+
+    # Constrain GrabCut so it cannot expand far beyond the original chromatic
+    # proposal. This directly targets the background leakage seen in validation.
+    allowed_region = cv2.dilate(
+        rough,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+        iterations=1,
+    )
+    refined = cv2.bitwise_and(refined, allowed_region)
+
+    # If GrabCut collapses or expands excessively, prefer the safer proposal.
+    rough_area = max(1, int(np.count_nonzero(rough)))
+    refined_area = int(np.count_nonzero(refined))
+    ratio = refined_area / rough_area
+    if refined_area < 0.55 * rough_area or refined_area > 1.35 * rough_area:
+        refined = rough.copy()
 
     refined = cv2.morphologyEx(
         refined,
@@ -193,8 +207,6 @@ def estimate_lesions(
     if centers.size == 0:
         return empty, empty.copy(), empty.copy()
 
-    # K-Means proposes image-specific color regions; pixel gates below keep
-    # only regions with meaningful distance from healthy green tissue.
     center_distance = np.sqrt(
         ((centers[:, 0] - ref_l) / 18.0) ** 2
         + ((centers[:, 1] - ref_a) / 10.0) ** 2
@@ -209,8 +221,6 @@ def estimate_lesions(
     b_delta = b - ref_b
     l_delta = l - ref_l
 
-    # Conservative local color signatures for brown/red necrosis and yellow
-    # chlorosis. These are engineering heuristics, not agricultural standards.
     brown_red = (
         (a_delta >= 9.0) & (b_delta >= -4.0) & (s >= 35) & (v >= 20)
     )
@@ -225,7 +235,6 @@ def estimate_lesions(
     necrotic = leaf & meaningful & (brown_red | dark_abnormal)
     chlorotic = leaf & meaningful & yellow & ~necrotic
 
-    # Exclude a narrow outer boundary band to reduce edge-shadow false positives.
     boundary_band = cv2.dilate(
         extract_boundary(leaf_mask, thickness=3),
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
