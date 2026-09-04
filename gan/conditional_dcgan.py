@@ -55,7 +55,7 @@ class ConditionalDiscriminator(nn.Module):
             raise ValueError("This implementation is intentionally fixed at 128x128.")
 
         self.label_embedding = nn.Embedding(num_classes, image_size * image_size)
-        self.net = nn.Sequential(
+        self.features = nn.Sequential(
             nn.Conv2d(4, base_channels, 4, 2, 1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1, bias=False),
@@ -69,11 +69,19 @@ class ConditionalDiscriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(base_channels * 8, 1, 4, 2, 1),
         )
+        self.output_pool = nn.AdaptiveAvgPool2d(1)
 
     def forward(self, images: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 4 or images.shape[1:] != (3, 128, 128):
+            raise ValueError(
+                "Expected images with shape [B, 3, 128, 128], "
+                f"got {tuple(images.shape)}"
+            )
         label_map = self.label_embedding(labels).view(labels.size(0), 1, 128, 128)
         x = torch.cat([images, label_map], dim=1)
-        return self.net(x).view(-1)
+        x = self.features(x)
+        x = self.output_pool(x)
+        return x.flatten(1).squeeze(1)
 
 
 def initialize_weights(module: nn.Module) -> None:
