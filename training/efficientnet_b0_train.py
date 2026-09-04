@@ -1,8 +1,9 @@
-"""Train and evaluate the EfficientNet-B0 baseline on Dataset A.
+"""Train and evaluate EfficientNet-B0 on Plant Doctor AI classification splits.
 
-Dataset A means original PlantVillage training images only; no GAN or
-traditional augmentation is enabled by default. Validation and test remain
-unchanged and deterministic.
+The same trainer supports controlled ablations:
+Dataset A = original RGB training images only.
+Dataset B = original RGB training images + traditional augmentation.
+Validation and test are always deterministic and never augmented.
 """
 from __future__ import annotations
 
@@ -17,7 +18,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_recall_fscore_support
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support,
+)
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
@@ -59,7 +65,6 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, train: bool):
     running_loss = 0.0
     y_true: list[int] = []
     y_pred: list[int] = []
-    use_amp = device.type == "cuda" and scaler is not None
 
     for images, labels in tqdm(loader, leave=False, desc="train" if train else "val"):
         images = images.to(device, non_blocking=True)
@@ -67,6 +72,7 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, train: bool):
         if train:
             optimizer.zero_grad(set_to_none=True)
 
+        use_amp = device.type == "cuda" and scaler is not None
         with autocast_context(use_amp):
             logits = model(images)
             loss = criterion(logits, labels)
@@ -90,7 +96,13 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, train: bool):
     return running_loss / total, accuracy, y_true, y_pred
 
 
-def measure_latency(model: nn.Module, device: torch.device, batch_size: int = 1, warmup: int = 20, runs: int = 100) -> float:
+def measure_latency(
+    model: nn.Module,
+    device: torch.device,
+    batch_size: int = 1,
+    warmup: int = 20,
+    runs: int = 100,
+) -> float:
     """Measure average single-batch inference time in milliseconds."""
     model.eval()
     x = torch.randn(batch_size, 3, 224, 224, device=device)
@@ -107,11 +119,19 @@ def measure_latency(model: nn.Module, device: torch.device, batch_size: int = 1,
     return (time.perf_counter() - start) * 1000.0 / runs
 
 
-def save_evaluation(output_dir: Path, y_true: list[int], y_pred: list[int], model: nn.Module, latency_ms: float) -> None:
+def save_evaluation(
+    output_dir: Path,
+    y_true: list[int],
+    y_pred: list[int],
+    model: nn.Module,
+    latency_ms: float,
+    experiment: str,
+) -> None:
     precision, recall, f1, support = precision_recall_fscore_support(
         y_true, y_pred, labels=list(range(NUM_CLASSES)), zero_division=0
     )
     metrics = {
+        "experiment": experiment,
         "accuracy": accuracy_score(y_true, y_pred),
         "macro_precision": float(precision.mean()),
         "macro_recall": float(recall.mean()),
@@ -142,11 +162,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("CUDA requested but no CUDA device is available.")
     device = torch.device(args.device)
 
+    experiment = "dataset_b_traditional_augmentation" if args.augmented else "dataset_a_original"
+
     train_loader, val_loader, test_loader = create_dataloaders(
         dataset_root=args.dataset_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        augmented=False,
+        augmented=args.augmented,
         seed=args.seed,
     )
 
@@ -154,7 +176,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     weights = class_weights_from_dataset(train_loader.dataset).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.3, patience=2, min_lr=1e-7)
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.3,
+        patience=2,
+        min_lr=1e-7,
+    )
 
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "best_efficientnet_b0.pt"
@@ -165,16 +193,25 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     best_val = -math.inf
     stale_epochs = 0
 
+    print(f"Experiment: {experiment}")
+    print(f"Training augmentation enabled: {args.augmented}")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Train/val/test: {len(train_loader.dataset)}/{len(val_loader.dataset)}/{len(test_loader.dataset)}")
+    print(
+        f"Train/val/test: {len(train_loader.dataset)}/"
+        f"{len(val_loader.dataset)}/{len(test_loader.dataset)}"
+    )
     print(f"Trainable parameters: {count_parameters(model):,}")
     print(f"Class weights: {weights.detach().cpu().numpy().round(4).tolist()}")
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc, _, _ = run_epoch(model, train_loader, criterion, optimizer, device, amp_scaler, train=True)
-        val_loss, val_acc, _, _ = run_epoch(model, val_loader, criterion, optimizer, device, amp_scaler, train=False)
+        train_loss, train_acc, _, _ = run_epoch(
+            model, train_loader, criterion, optimizer, device, amp_scaler, train=True
+        )
+        val_loss, val_acc, _, _ = run_epoch(
+            model, val_loader, criterion, optimizer, device, amp_scaler, train=False
+        )
         scheduler.step(val_acc)
         row = {
             "epoch": epoch,
@@ -186,8 +223,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         }
         history.append(row)
         print(
-            f"Epoch {epoch:02d}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} lr={row['learning_rate']:.2e}"
+            f"Epoch {epoch:02d}: train_loss={train_loss:.4f} "
+            f"train_acc={train_acc:.4f} val_loss={val_loss:.4f} "
+            f"val_acc={val_acc:.4f} lr={row['learning_rate']:.2e}"
         )
 
         if val_acc > best_val:
@@ -202,6 +240,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     "best_val_accuracy": best_val,
                     "model": "EfficientNet-B0",
                     "pretrained_backbone": not args.no_pretrained,
+                    "experiment": experiment,
+                    "training_augmentation": args.augmented,
                 },
                 checkpoint_path,
             )
@@ -214,15 +254,29 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     pd.DataFrame(history).to_csv(output_dir / "training_history.csv", index=False)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_loss, test_acc, y_true, y_pred = run_epoch(model, test_loader, criterion, optimizer, device, amp_scaler, train=False)
+    test_loss, test_acc, y_true, y_pred = run_epoch(
+        model, test_loader, criterion, optimizer, device, amp_scaler, train=False
+    )
     latency_ms = measure_latency(model, device)
-    save_evaluation(output_dir, y_true, y_pred, model, latency_ms)
+    save_evaluation(
+        output_dir,
+        y_true,
+        y_pred,
+        model,
+        latency_ms,
+        experiment=experiment,
+    )
     print(f"Best validation accuracy: {best_val:.4f}")
     print(f"Test accuracy: {test_acc:.4f}")
     print(f"Test loss: {test_loss:.4f}")
     print(f"Single-image latency: {latency_ms:.3f} ms")
     print(f"Checkpoint: {checkpoint_path}")
-    return {"best_val_accuracy": best_val, "test_accuracy": test_acc, "latency_ms": latency_ms}
+    return {
+        "experiment": experiment,
+        "best_val_accuracy": best_val,
+        "test_accuracy": test_acc,
+        "latency_ms": latency_ms,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,6 +293,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--augmented",
+        action="store_true",
+        help="Enable Dataset B traditional training augmentation; validation/test stay deterministic.",
+    )
     return parser.parse_args()
 
 
